@@ -1,52 +1,42 @@
 require 'net/http'
-require 'net/https'
+require 'tempfile'
+require 'securerandom'
 
-module Net
-  class HTTP
-    def begin_transport(req)
-      if @socket.closed?
-        req.reset_upload_size
-        connect
-      end
-      if not req.response_body_permitted? and @close_on_empty_response
-        req['connection'] ||= 'close'
-      end
-      req['host'] ||= addr_port()
+class Net::HTTP::UploadProgress
+  attr_reader :upload_size
+
+  def initialize(req, &block)
+    @req = req
+    @callback = block
+    @upload_size = 0
+    if req.body_stream
+      @io = req.body_stream
+      req.body_stream = self
+    elsif req.instance_variable_get(:@body_data)
+      raise NotImplementedError if req.chunked?
+      raise NotImplementedError if /\Amultipart\/form-data\z/i !~ req.content_type
+      opt = req.instance_variable_get(:@form_option).dup
+      opt[:boundary] ||= SecureRandom.urlsafe_base64(40)
+      req.set_content_type(req.content_type, boundary: opt[:boundary])
+      file = Tempfile.new('multipart')
+      file.binmode
+      req.send(:encode_multipart_form_data, file, req.instance_variable_get(:@body_data), opt)
+      file.rewind
+      req.content_length = file.size
+      @io = file
+      req.body_stream = self
+    else
+      raise NotImplementedError
     end
   end
 
-  class HTTPGenericRequest
-    def reset_upload_size
-      @upload_size = 0
+  def readpartial(maxlen, outbuf)
+    begin
+      str = @io.readpartial(maxlen, outbuf)
+    ensure
+      @callback.call(self) unless @upload_size.zero?
     end
-
-    def upload_size
-      @upload_size = 0 if @upload_size.nil?
-      @upload_size
-    end
-
-    private
-
-    def send_request_with_body_stream(sock, ver, path, f)
-      unless content_length() or chunked?
-        raise ArgumentError,
-          "Content-Length not given and Transfer-Encoding is not `chunked'"
-      end
-      @upload_size = 0 if @upload_size.nil?
-      supply_default_content_type
-      write_header sock, ver, path
-      if chunked?
-        while s = f.read(1024)
-          @upload_size += s.length
-          sock.write(sprintf("%x\r\n", s.length) << s << "\r\n")
-        end
-        sock.write "0\r\n\r\n"
-      else
-        while s = f.read(1024)
-          @upload_size += s.length
-          sock.write s
-        end
-      end
-    end
+    @upload_size += str.length
+    str
   end
 end
